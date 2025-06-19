@@ -21,7 +21,8 @@ jobs:
     - name: Install Python dependencies
       run: |
         cd backend
-        pip install -r requirements.txt
+        pip install --upgrade pip
+        pip install -r requirements.txt --use-pep517
     
     - name: Set up Node.js
       uses: actions/setup-node@v4
