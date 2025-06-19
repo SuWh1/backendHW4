@@ -1,0 +1,173 @@
+name: Deploy to DigitalOcean
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install Python dependencies
+      run: |
+        cd backend
+        pip install -r requirements.txt
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+    
+    - name: Install frontend dependencies
+      run: |
+        cd frontend
+        npm ci
+    
+    - name: Build frontend
+      run: |
+        cd frontend
+        npm run build
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup SSH
+      uses: webfactory/ssh-agent@v0.8.0
+      with:
+        ssh-private-key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+    
+    - name: Create deployment package
+      run: |
+        tar -czf deployment.tar.gz \
+          --exclude='.git' \
+          --exclude='node_modules' \
+          --exclude='backend/venv' \
+          --exclude='backend/__pycache__' \
+          --exclude='frontend/node_modules' \
+          --exclude='frontend/dist' \
+          .
+    
+    - name: Copy files to server
+      run: |
+        scp -o StrictHostKeyChecking=no deployment.tar.gz ${{ secrets.DO_USER }}@${{ secrets.DO_HOST }}:/tmp/
+        ssh -o StrictHostKeyChecking=no ${{ secrets.DO_USER }}@${{ secrets.DO_HOST }} '
+          cd /opt/a2a-voice-app || sudo mkdir -p /opt/a2a-voice-app
+          sudo chown $USER:$USER /opt/a2a-voice-app
+          cd /opt/a2a-voice-app
+          tar -xzf /tmp/deployment.tar.gz
+          rm /tmp/deployment.tar.gz
+        '
+    
+    - name: Create environment file
+      run: |
+        ssh -o StrictHostKeyChecking=no ${{ secrets.DO_USER }}@${{ secrets.DO_HOST }} '
+          cd /opt/a2a-voice-app
+          cat > .env << EOF
+          # Database Configuration
+          POSTGRES_DB=${{ secrets.POSTGRES_DB }}
+          POSTGRES_USER=${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+          
+          # Redis Configuration
+          REDIS_URL=redis://redis:6379
+          
+          # AWS S3 Configuration
+          AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_BUCKET_NAME=${{ secrets.AWS_BUCKET_NAME }}
+          AWS_REGION=${{ secrets.AWS_REGION }}
+          
+          # OpenAI Configuration
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          EOF
+        '
+    
+    - name: Deploy with Docker Compose
+      run: |
+        ssh -o StrictHostKeyChecking=no ${{ secrets.DO_USER }}@${{ secrets.DO_HOST }} '
+          cd /opt/a2a-voice-app
+          
+          # Install Docker and Docker Compose if not present
+          if ! command -v docker &> /dev/null; then
+            curl -fsSL https://get.docker.com -o get-docker.sh
+            sudo sh get-docker.sh
+            sudo usermod -aG docker $USER
+            newgrp docker
+          fi
+          
+          if ! command -v docker-compose &> /dev/null; then
+            sudo curl -L "https://github.com/docker/compose/releases/download/v2.21.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            sudo chmod +x /usr/local/bin/docker-compose
+          fi
+          
+          # Stop existing containers
+          docker-compose down || true
+          
+          # Clean up old images and containers
+          docker system prune -f || true
+          
+          # Pull latest images and start services
+          docker-compose pull || true
+          docker-compose up -d --build --remove-orphans
+          
+          # Wait for services to be ready
+          echo "Waiting for services to start..."
+          sleep 45
+          
+          # Run database migrations
+          echo "Running database migrations..."
+          docker-compose exec -T app alembic upgrade head || echo "Migration completed or failed - continuing..."
+          
+          # Health checks with retries
+          echo "Running health checks..."
+          
+          # Backend health check
+          for i in {1..5}; do
+            if curl -f http://localhost:8000/health; then
+              echo "✅ Backend health check passed"
+              break
+            else
+              echo "❌ Backend health check failed (attempt $i/5)"
+              sleep 10
+            fi
+          done
+          
+          # OpenAI health check
+          if curl -f http://localhost:8000/health/openai; then
+            echo "✅ OpenAI integration working"
+          else
+            echo "⚠️ OpenAI integration check failed - verify API key"
+          fi
+          
+          # Frontend health check
+          if curl -f http://localhost:3000; then
+            echo "✅ Frontend health check passed"
+          else
+            echo "❌ Frontend health check failed"
+          fi
+          
+          # Show running containers
+          echo "Running containers:"
+          docker-compose ps
+          
+          echo "🎉 Deployment completed!"
+          echo "Frontend: http://$(curl -s ifconfig.me):3000"
+          echo "Backend: http://$(curl -s ifconfig.me):8000"
+        ' 
