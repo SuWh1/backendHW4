@@ -56,7 +56,34 @@ jobs:
     
     - name: Create deployment package
       run: |
+        # Clean any temporary files first
+        find . -name "*.pyc" -delete 2>/dev/null || true
+        find . -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+        find . -name "*.log" -delete 2>/dev/null || true
+        find . -name "*.tmp" -delete 2>/dev/null || true
+        
+        # Create deployment package with exclusions and ignore file changes
         tar -czf deployment.tar.gz \
+          --exclude='.git' \
+          --exclude='node_modules' \
+          --exclude='backend/venv' \
+          --exclude='backend/__pycache__' \
+          --exclude='frontend/node_modules' \
+          --exclude='frontend/dist' \
+          --exclude='*.log' \
+          --exclude='*.tmp' \
+          --exclude='.pytest_cache' \
+          --exclude='.coverage' \
+          --exclude='htmlcov' \
+          --exclude='.tox' \
+          --exclude='.env' \
+          --exclude='*.sqlite' \
+          --exclude='*.db' \
+          --exclude='.DS_Store' \
+          --exclude='Thumbs.db' \
+          --warning=no-file-changed \
+          --warning=no-file-removed \
+          . 2>/dev/null || tar -czf deployment.tar.gz \
           --exclude='.git' \
           --exclude='node_modules' \
           --exclude='backend/venv' \
