@@ -1,21 +1,35 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, status
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import List
 import uvicorn
+import json
+import base64
+import asyncio
+import logging
 
 from database import get_db, engine, Base
-from models import Item, FileUpload
-from schemas import ItemCreate, ItemUpdate, ItemResponse, FileUploadResponse
+from models import Item, FileUpload, Agent, CommunicationSession, VoiceMessage
+from schemas import (
+    ItemCreate, ItemUpdate, ItemResponse, FileUploadResponse,
+    AgentCreate, AgentUpdate, AgentResponse, CommunicationSessionResponse,
+    VoiceMessageResponse, WebSocketMessage, VoiceData, StatusUpdate, ConnectionRequest
+)
 from redis_client import redis_client
 from s3_client import s3_client
 from tasks import process_file_upload
+from websocket_manager import connection_manager
+from openai_service import openai_service
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Production FastAPI App",
-    description="A production-ready FastAPI application with PostgreSQL, Redis, Celery, and S3",
-    version="1.0.0"
+    title="A2A Voice Communication System",
+    description="Agent-to-Agent Voice-to-Voice communication with OpenAI integration",
+    version="2.0.0"
 )
 
 # CORS middleware
@@ -222,12 +236,146 @@ async def delete_uploaded_file(file_id: int, db: AsyncSession = Depends(get_db))
     return {"message": "File deleted successfully"}
 
 
+# A2A Communication Endpoints
+
+@app.post("/agents/", response_model=AgentResponse, status_code=status.HTTP_201_CREATED)
+async def create_agent(agent: AgentCreate, db: AsyncSession = Depends(get_db)):
+    """Create a new agent"""
+    # Check if agent_id already exists
+    result = await db.execute(select(Agent).where(Agent.agent_id == agent.agent_id))
+    existing_agent = result.scalar_one_or_none()
+    
+    if existing_agent:
+        raise HTTPException(status_code=400, detail="Agent ID already exists")
+    
+    db_agent = Agent(**agent.dict())
+    db.add(db_agent)
+    await db.commit()
+    await db.refresh(db_agent)
+    
+    return db_agent
+
+
+@app.get("/agents/", response_model=List[AgentResponse])
+async def get_agents(db: AsyncSession = Depends(get_db)):
+    """Get all agents"""
+    result = await db.execute(select(Agent))
+    agents = result.scalars().all()
+    return agents
+
+
+@app.get("/agents/online", response_model=List[dict])
+async def get_online_agents():
+    """Get currently online agents"""
+    return connection_manager.get_online_agents()
+
+
+@app.get("/sessions/active", response_model=List[dict])
+async def get_active_sessions():
+    """Get active communication sessions"""
+    return connection_manager.get_active_sessions()
+
+
+# WebSocket endpoint for A2A communication
+@app.websocket("/ws/{agent_id}")
+async def websocket_endpoint(websocket: WebSocket, agent_id: str):
+    """WebSocket endpoint for real-time A2A voice communication"""
+    await connection_manager.connect(websocket, agent_id)
+    
+    try:
+        while True:
+            # Receive message from client
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            
+            message_type = message.get("type")
+            message_data = message.get("data", {})
+            
+            if message_type == "voice_message":
+                # Handle voice message
+                await handle_voice_message(agent_id, message_data)
+            
+            elif message_type == "status_update":
+                # Handle status update
+                status = message_data.get("status")
+                await connection_manager.update_agent_status(agent_id, status)
+            
+            elif message_type == "start_session":
+                # Start communication session
+                target_id = message_data.get("target_agent_id")
+                session_id = await connection_manager.start_communication_session(agent_id, target_id)
+                
+                if session_id:
+                    response = {
+                        "type": "session_created",
+                        "data": {"session_id": session_id}
+                    }
+                    await websocket.send_text(json.dumps(response))
+            
+            elif message_type == "end_session":
+                # End communication session
+                session_id = message_data.get("session_id")
+                await connection_manager.end_communication_session(session_id)
+            
+            else:
+                logger.warning(f"Unknown message type: {message_type}")
+    
+    except WebSocketDisconnect:
+        connection_manager.disconnect(agent_id)
+        logger.info(f"Agent {agent_id} disconnected")
+
+
+async def handle_voice_message(sender_id: str, voice_data: dict):
+    """Process voice message through OpenAI and handle response"""
+    try:
+        # Extract audio data
+        audio_base64 = voice_data.get("audio_base64")
+        if not audio_base64:
+            logger.error("No audio data provided in voice message")
+            return
+        
+        # Decode base64 audio
+        audio_bytes = base64.b64decode(audio_base64)
+        
+        # Update sender status to "thinking"
+        await connection_manager.update_agent_status(sender_id, "thinking")
+        
+        # Process through OpenAI
+        ai_result = await openai_service.process_voice_message(audio_bytes)
+        
+        if ai_result["success"]:
+            # Send AI response back to sender
+            await connection_manager.handle_ai_response(sender_id, ai_result)
+            
+            # Update status to "speaking"
+            await connection_manager.update_agent_status(sender_id, "speaking")
+            
+            # After a delay, set back to "online"
+            await asyncio.sleep(3)  # Simulate speaking time
+            await connection_manager.update_agent_status(sender_id, "online")
+        else:
+            # Handle error
+            error_message = {
+                "type": "error",
+                "data": {
+                    "message": "Failed to process voice message",
+                    "timestamp": voice_data.get("timestamp")
+                }
+            }
+            await connection_manager.send_personal_message(error_message, sender_id)
+            await connection_manager.update_agent_status(sender_id, "online")
+    
+    except Exception as e:
+        logger.error(f"Error handling voice message: {e}")
+        await connection_manager.update_agent_status(sender_id, "online")
+
+
 # Health Check Endpoints
 
 @app.get("/health")
 async def health_check():
     """Basic health check endpoint"""
-    return {"status": "healthy", "service": "FastAPI App"}
+    return {"status": "healthy", "service": "A2A Voice Communication System"}
 
 
 @app.get("/health/redis")
@@ -242,6 +390,15 @@ async def redis_health_check():
             return {"status": "unhealthy", "service": "Redis"}
     except Exception as e:
         return {"status": "unhealthy", "service": "Redis", "error": str(e)}
+
+
+@app.get("/health/openai")
+async def openai_health_check():
+    """OpenAI integration health check"""
+    if openai_service.client:
+        return {"status": "healthy", "service": "OpenAI", "message": "API key configured"}
+    else:
+        return {"status": "unhealthy", "service": "OpenAI", "message": "API key not configured"}
 
 
 if __name__ == "__main__":
